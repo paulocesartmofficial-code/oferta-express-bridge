@@ -560,6 +560,73 @@ async function extractFromPageSource(page, canonicalUrl) {
   return null;
 }
 
+
+async function fetchDirectProduct(canonicalUrl, context) {
+  const { shopId, itemId } = extractIdsFromUrl(canonicalUrl);
+  if (!shopId || !itemId) return null;
+
+  const cookies = await context.cookies().catch(() => []);
+  const cookieHeader = cookies.map(c => `${c.name}=${c.value}`).join("; ");
+
+  const endpoints = [
+    `https://shopee.com.br/api/v4/item/get?itemid=${encodeURIComponent(itemId)}&shopid=${encodeURIComponent(shopId)}`,
+    `https://shopee.com.br/api/v4/pdp/get_pc?item_id=${encodeURIComponent(itemId)}&shop_id=${encodeURIComponent(shopId)}`
+  ];
+
+  for (const endpoint of endpoints) {
+    try {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 15000);
+      let response;
+      try {
+        response = await fetch(endpoint, {
+          headers: {
+            "accept": "application/json, text/plain, */*",
+            "accept-language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
+            "referer": canonicalUrl,
+            "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+            "x-api-source": "pc",
+            ...(cookieHeader ? { "cookie": cookieHeader } : {})
+          },
+          signal: controller.signal,
+          redirect: "follow"
+        });
+      } finally {
+        clearTimeout(timer);
+      }
+
+      const body = await response.text();
+      log("DIRECT API", {
+        endpoint: new URL(endpoint).pathname,
+        status: response.status,
+        bytes: body.length
+      });
+
+      if (!response.ok || !body) continue;
+
+      let data = null;
+      try { data = JSON.parse(body); } catch {}
+
+      if (data) {
+        const p = productFromJson(data, canonicalUrl, "direct_server_api");
+        if (p?.currentPrice) return p;
+      }
+
+      const raw = productFromRawText(body, canonicalUrl);
+      if (raw?.currentPrice) {
+        return { ...raw, source: "direct_server_text" };
+      }
+    } catch (err) {
+      log("DIRECT API ERROR", {
+        endpoint: new URL(endpoint).pathname,
+        error: err?.message || String(err)
+      });
+    }
+  }
+
+  return null;
+}
+
 async function scrapeShopee(rawUrl) {
   const safeUrl = assertShopeeUrl(rawUrl);
   const browser = await getBrowser();
@@ -678,6 +745,14 @@ async function scrapeShopee(rawUrl) {
     }
 
     log("FINAL URL", canonicalUrl);
+
+    // v7: tenta os IDs já resolvidos diretamente no servidor, reaproveitando
+    // os cookies criados pelo Chromium. Isso não depende de XHR/fetch da página.
+    const directProduct = await fetchDirectProduct(canonicalUrl, context);
+    if (directProduct?.currentPrice) {
+      log("FOUND VIA DIRECT SERVER API");
+      return directProduct;
+    }
 
     // Se a rede já entregou o produto, não esperamos mais.
     if (networkProduct?.currentPrice) {
@@ -859,7 +934,7 @@ app.get("/", (_req, res) => {
   res.json({
     ok: true,
     service: "Oferta Express Bridge",
-    version: "6.0",
+    version: "7.0",
     mode: "Playwright/Chromium"
   });
 });
@@ -868,7 +943,7 @@ app.get("/health", (_req, res) => {
   res.json({
     ok: true,
     service: "Oferta Express Bridge",
-    version: "6.0",
+    version: "7.0",
     tokenConfigured: Boolean(BRIDGE_TOKEN)
   });
 });
@@ -915,9 +990,10 @@ app.post("/resolve", async (req, res) => {
       message
     });
 
-    return res.status(502).json({
+    return res.status(200).json({
       ok: false,
-      error: message
+      error: message,
+      retryable: true
     });
   }
 });
@@ -930,7 +1006,7 @@ app.use((_req, res) => {
 });
 
 app.listen(PORT, "0.0.0.0", () => {
-  log(`Oferta Express Bridge v6 online na porta ${PORT}`);
+  log(`Oferta Express Bridge v7 online na porta ${PORT}`);
 
   if (!BRIDGE_TOKEN) {
     log("ATENÇÃO: configure BRIDGE_TOKEN antes de usar /resolve.");
