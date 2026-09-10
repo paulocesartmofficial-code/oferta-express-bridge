@@ -1,0 +1,6 @@
+Gere/use um token secreto seu. Exemplo aleatório gerado para este pacote:
+
+WDVnycbemqFDce24G6oiu9fRyCo5MHj-fsfqJ9Gkv0c
+
+No Bridge: BRIDGE_TOKEN=<token>
+No Oferta Express principal: PC_BRIDGE_TOKEN=<mesmo token>

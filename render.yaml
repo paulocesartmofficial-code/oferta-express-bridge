@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: oferta-express-bridge
+    runtime: docker
+    plan: free
+    healthCheckPath: /health
+    envVars:
+      - key: BRIDGE_TOKEN
+        sync: false
+      - key: NAV_TIMEOUT_MS
+        value: "45000"
