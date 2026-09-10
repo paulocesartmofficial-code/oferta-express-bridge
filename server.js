@@ -8,7 +8,7 @@ app.use(express.json({ limit: "32kb" }));
 const PORT = Number(process.env.PORT || 10000);
 const BRIDGE_TOKEN = String(process.env.BRIDGE_TOKEN || "").trim();
 const CHROMIUM_PATH = process.env.CHROMIUM_PATH || "/usr/bin/chromium";
-const NAV_TIMEOUT = Number(process.env.NAV_TIMEOUT_MS || 45000);
+const NAV_TIMEOUT = Number(process.env.NAV_TIMEOUT_MS || 300000);
 
 let browserPromise = null;
 
@@ -238,14 +238,40 @@ async function scrapeShopee(rawUrl) {
   });
 
   try {
-    log("OPEN", safeUrl);
+  await page.goto(safeUrl, {
+    waitUntil: "domcontentloaded",
+    timeout: NAV_TIMEOUT
+  });
+} catch (err) {
+  log("NAVIGATION NOTICE", err?.message || String(err));
+}
 
-    await page.goto(safeUrl, {
-      waitUntil: "domcontentloaded",
-      timeout: NAV_TIMEOUT
-    });
+// Links curtos da Shopee fazem vários redirecionamentos.
+// Esperamos a URL parar de mudar antes de tentar ler o produto.
+let ultimaUrl = page.url();
+let urlEstavel = 0;
 
-    await page.waitForTimeout(3500);
+for (let i = 0; i < 30; i++) {
+  await page.waitForTimeout(1000);
+
+  const urlAtual = page.url();
+
+  if (urlAtual === ultimaUrl) {
+    urlEstavel++;
+
+    if (urlEstavel >= 3) {
+      break;
+    }
+  } else {
+    ultimaUrl = urlAtual;
+    urlEstavel = 0;
+  }
+}
+
+log("FINAL URL", page.url());
+
+// Espera a aplicação da Shopee carregar os dados dinâmicos.
+await page.waitForTimeout(5000);
 
     // O link curto pode ter redirecionado para um host final da Shopee.
     const canonicalUrl = page.url();
