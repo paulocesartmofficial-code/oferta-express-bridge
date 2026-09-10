@@ -431,7 +431,7 @@ async function scrapeShopee(rawUrl) {
       log("NAVIGATION NOTICE", err?.message || String(err));
     }
 
-    const canonicalUrl = await waitForStableUrl(page, 7000);
+    const canonicalUrl = await waitForStableUrl(page, 12000);
 
     const final = new URL(canonicalUrl);
 
@@ -465,46 +465,81 @@ async function scrapeShopee(rawUrl) {
       return scriptProduct;
     }
 
-    const dom = await page.evaluate(() => {
-      const text = sel =>
-        document.querySelector(sel)?.textContent?.trim() || undefined;
+    let dom = null;
+    let lastEvaluateError = null;
 
-      const attr = (sel, name) =>
-        document.querySelector(sel)?.getAttribute(name) || undefined;
+    // A Shopee pode fazer mais uma navegação client-side mesmo depois
+    // de a URL já parecer estável. Em vez de falhar, tentamos novamente.
+    for (let attempt = 1; attempt <= 6; attempt++) {
+      try {
+        await page.waitForLoadState("domcontentloaded", { timeout: 15000 }).catch(() => {});
+        await sleep(1500);
 
-      const metas = {};
+        dom = await page.evaluate(() => {
+          const text = sel =>
+            document.querySelector(sel)?.textContent?.trim() || undefined;
 
-      for (const m of document.querySelectorAll("meta")) {
-        const key = m.getAttribute("property") || m.getAttribute("name");
-        const val = m.getAttribute("content");
-        if (key && val) metas[key] = val;
+          const attr = (sel, name) =>
+            document.querySelector(sel)?.getAttribute(name) || undefined;
+
+          const metas = {};
+
+          for (const m of document.querySelectorAll("meta")) {
+            const key = m.getAttribute("property") || m.getAttribute("name");
+            const val = m.getAttribute("content");
+            if (key && val) metas[key] = val;
+          }
+
+          const bodyText = document.body?.innerText || "";
+
+          return {
+            title:
+              text("h1") ||
+              metas["og:title"] ||
+              document.title ||
+              undefined,
+
+            image:
+              metas["og:image"] ||
+              metas["twitter:image"] ||
+              attr('link[rel="image_src"]', "href"),
+
+            metaPrice:
+              metas["product:price:amount"] ||
+              metas["og:price:amount"] ||
+              metas["product:price"] ||
+              metas["twitter:data1"],
+
+            bodyText: bodyText.slice(0, 100000)
+          };
+        });
+
+        log("DOM READ SUCCESS", { attempt, url: page.url() });
+        break;
+      } catch (err) {
+        lastEvaluateError = err;
+        const msg = err?.message || String(err);
+
+        log("DOM READ RETRY", { attempt, message: msg, url: page.url() });
+
+        if (
+          /Execution context was destroyed|navigation|Target page, context or browser has been closed/i.test(msg)
+        ) {
+          await sleep(2000);
+          continue;
+        }
+
+        throw err;
       }
+    }
 
-      const bodyText = document.body?.innerText || "";
-
-      return {
-        title:
-          text("h1") ||
-          metas["og:title"] ||
-          document.title ||
-          undefined,
-
-        image:
-          metas["og:image"] ||
-          metas["twitter:image"] ||
-          attr('link[rel="image_src"]', "href"),
-
-        metaPrice:
-          metas["product:price:amount"] ||
-          metas["og:price:amount"] ||
-          metas["product:price"] ||
-          metas["twitter:data1"],
-
-        bodyText: bodyText.slice(0, 100000)
-      };
-    }).catch(err => {
-      throw new Error(`Falha ao ler a página após o redirecionamento: ${err.message}`);
-    });
+    if (!dom) {
+      throw new Error(
+        `Falha ao ler a página após várias tentativas: ${
+          lastEvaluateError?.message || "erro desconhecido"
+        }`
+      );
+    }
 
     const challenge =
       /captcha|verifique|verification|unusual|robô|robot|access denied|bloquead/i
