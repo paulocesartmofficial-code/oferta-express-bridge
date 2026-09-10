@@ -355,6 +355,202 @@ async function extractFromScripts(page, canonicalUrl) {
   return best;
 }
 
+
+function extractIdsFromUrl(url) {
+  try {
+    const u = new URL(url);
+    const m = u.pathname.match(/\/(?:[^/]+\/)?(\d+)\/(\d+)(?:\/|$)/);
+    if (m) return { shopId: m[1], itemId: m[2] };
+
+    const itemId = u.searchParams.get("itemid") || u.searchParams.get("item_id");
+    const shopId = u.searchParams.get("shopid") || u.searchParams.get("shop_id");
+    if (itemId && shopId) return { shopId, itemId };
+  } catch {}
+  return { shopId: undefined, itemId: undefined };
+}
+
+async function fetchProductInsideBrowser(page, canonicalUrl) {
+  const { shopId, itemId } = extractIdsFromUrl(canonicalUrl);
+  if (!shopId || !itemId) {
+    log("BROWSER API SKIP", "shopId/itemId não encontrados");
+    return null;
+  }
+
+  const result = await page.evaluate(async ({ shopId, itemId }) => {
+    const csrfMatch = document.cookie.match(/(?:^|;\s*)csrftoken=([^;]+)/);
+    const csrf = csrfMatch ? decodeURIComponent(csrfMatch[1]) : "";
+
+    const endpoints = [
+      `/api/v4/item/get?itemid=${encodeURIComponent(itemId)}&shopid=${encodeURIComponent(shopId)}`,
+      `/api/v4/pdp/get_pc?item_id=${encodeURIComponent(itemId)}&shop_id=${encodeURIComponent(shopId)}`
+    ];
+
+    const attempts = [];
+
+    for (const endpoint of endpoints) {
+      try {
+        const headers = {
+          "accept": "application/json, text/plain, */*",
+          "x-api-source": "pc"
+        };
+        if (csrf) headers["x-csrftoken"] = csrf;
+
+        const response = await fetch(endpoint, {
+          method: "GET",
+          credentials: "include",
+          headers
+        });
+
+        const txt = await response.text();
+        let data = null;
+        try { data = JSON.parse(txt); } catch {}
+
+        attempts.push({
+          endpoint,
+          status: response.status,
+          ok: response.ok,
+          data,
+          text: data ? undefined : txt.slice(0, 5000)
+        });
+
+        if (response.ok && data) {
+          return {
+            success: true,
+            endpoint,
+            status: response.status,
+            data,
+            attempts
+          };
+        }
+      } catch (err) {
+        attempts.push({
+          endpoint,
+          error: err?.message || String(err)
+        });
+      }
+    }
+
+    return { success: false, attempts };
+  }, { shopId, itemId }).catch(err => ({
+    success: false,
+    evaluateError: err?.message || String(err),
+    attempts: []
+  }));
+
+  for (const attempt of result.attempts || []) {
+    log("BROWSER API", {
+      endpoint: attempt.endpoint,
+      status: attempt.status,
+      ok: attempt.ok,
+      error: attempt.error
+    });
+  }
+
+  if (result.success && result.data) {
+    const p = productFromJson(result.data, canonicalUrl, "browser_same_origin_api");
+    if (p?.currentPrice) return p;
+  }
+
+  return null;
+}
+
+function productFromRawText(raw, canonicalUrl) {
+  if (!raw) return null;
+  const txt = String(raw);
+
+  const pricePatterns = [
+    /["']price["']\s*:\s*(\d{3,})/gi,
+    /["']price_min["']\s*:\s*(\d{3,})/gi,
+    /["']current_price["']\s*:\s*(\d{3,})/gi,
+    /\\"price\\"\s*:\s*(\d{3,})/gi,
+    /\\"price_min\\"\s*:\s*(\d{3,})/gi
+  ];
+
+  const prices = [];
+  for (const rx of pricePatterns) {
+    let m;
+    while ((m = rx.exec(txt)) && prices.length < 100) {
+      const n = normalizeShopeePrice(m[1]);
+      if (n && n > 0 && n < 1000000) prices.push(n);
+    }
+  }
+
+  if (!prices.length) return null;
+
+  const uniquePrices = [...new Set(prices)];
+  const currentPrice = uniquePrices[0];
+
+  const titlePatterns = [
+    /["']name["']\s*:\s*"([^"]{4,300})"/i,
+    /["']item_name["']\s*:\s*"([^"]{4,300})"/i,
+    /\\"name\\"\s*:\s*\\"([^"]{4,300})\\"/i
+  ];
+
+  let title;
+  for (const rx of titlePatterns) {
+    const m = txt.match(rx);
+    if (m?.[1]) {
+      title = m[1]
+        .replace(/\\u([\da-fA-F]{4})/g, (_, h) => String.fromCharCode(parseInt(h, 16)))
+        .replace(/\\"/g, '"')
+        .replace(/\\n/g, " ")
+        .trim();
+      if (title) break;
+    }
+  }
+
+  const imageMatches = [];
+  const imagePatterns = [
+    /["']image["']\s*:\s*"([^"]{10,500})"/gi,
+    /["']image_url["']\s*:\s*"([^"]{10,500})"/gi,
+    /\\"image\\"\s*:\s*\\"([^"]{10,500})\\"/gi
+  ];
+
+  for (const rx of imagePatterns) {
+    let m;
+    while ((m = rx.exec(txt)) && imageMatches.length < 20) {
+      imageMatches.push(m[1].replace(/\\\//g, "/"));
+    }
+  }
+
+  const images = uniqueStrings(imageMatches.map(imageUrlFromShopee));
+
+  const larger = uniquePrices.find(p => p > currentPrice);
+
+  return {
+    title: title || undefined,
+    currentPrice,
+    originalPrice: larger,
+    images,
+    rating: undefined,
+    soldCount: undefined,
+    sellerName: undefined,
+    canonicalUrl,
+    source: "raw_text_fallback"
+  };
+}
+
+async function extractFromPageSource(page, canonicalUrl) {
+  const html = await page.content().catch(() => "");
+  const fromHtml = productFromRawText(html, canonicalUrl);
+  if (fromHtml?.currentPrice) return fromHtml;
+
+  const scripts = await page.evaluate(() =>
+    [...document.scripts]
+      .map(s => s.textContent || "")
+      .filter(Boolean)
+      .sort((a, b) => b.length - a.length)
+      .slice(0, 80)
+  ).catch(() => []);
+
+  for (const raw of scripts) {
+    const p = productFromRawText(raw, canonicalUrl);
+    if (p?.currentPrice) return p;
+  }
+
+  return null;
+}
+
 async function scrapeShopee(rawUrl) {
   const safeUrl = assertShopeeUrl(rawUrl);
   const browser = await getBrowser();
@@ -457,12 +653,27 @@ async function scrapeShopee(rawUrl) {
       return networkProduct;
     }
 
+    // Tenta a API da Shopee a partir do próprio navegador, com cookies/sessão.
+    const browserApiProduct = await fetchProductInsideBrowser(page, canonicalUrl);
+    if (browserApiProduct?.currentPrice) {
+      log("FOUND VIA BROWSER API");
+      return browserApiProduct;
+    }
+
     // Procura JSON embutido na página.
     const scriptProduct = await extractFromScripts(page, canonicalUrl);
 
     if (scriptProduct?.currentPrice) {
       log("FOUND VIA SCRIPT");
       return scriptProduct;
+    }
+
+    // Procura campos de preço/nome/imagem no HTML e scripts mesmo quando
+    // eles não formam JSON puro.
+    const sourceProduct = await extractFromPageSource(page, canonicalUrl);
+    if (sourceProduct?.currentPrice) {
+      log("FOUND VIA PAGE SOURCE");
+      return sourceProduct;
     }
 
     let dom = null;
@@ -589,7 +800,7 @@ app.get("/", (_req, res) => {
   res.json({
     ok: true,
     service: "Oferta Express Bridge",
-    version: "2.0",
+    version: "4.0",
     mode: "Playwright/Chromium"
   });
 });
@@ -598,7 +809,7 @@ app.get("/health", (_req, res) => {
   res.json({
     ok: true,
     service: "Oferta Express Bridge",
-    version: "2.0",
+    version: "4.0",
     tokenConfigured: Boolean(BRIDGE_TOKEN)
   });
 });
@@ -660,7 +871,7 @@ app.use((_req, res) => {
 });
 
 app.listen(PORT, "0.0.0.0", () => {
-  log(`Oferta Express Bridge v2 online na porta ${PORT}`);
+  log(`Oferta Express Bridge v4 online na porta ${PORT}`);
 
   if (!BRIDGE_TOKEN) {
     log("ATENÇÃO: configure BRIDGE_TOKEN antes de usar /resolve.");
