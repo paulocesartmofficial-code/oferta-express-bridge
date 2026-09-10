@@ -395,11 +395,20 @@ async function fetchProductInsideBrowser(page, canonicalUrl) {
         };
         if (csrf) headers["x-csrftoken"] = csrf;
 
-        const response = await fetch(endpoint, {
-          method: "GET",
-          credentials: "include",
-          headers
-        });
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), 8000);
+
+        let response;
+        try {
+          response = await fetch(endpoint, {
+            method: "GET",
+            credentials: "include",
+            headers,
+            signal: controller.signal
+          });
+        } finally {
+          clearTimeout(timer);
+        }
 
         const txt = await response.text();
         let data = null;
@@ -570,7 +579,7 @@ async function scrapeShopee(rawUrl) {
 
   const page = await context.newPage();
   page.setDefaultNavigationTimeout(NAV_TIMEOUT);
-  page.setDefaultTimeout(6000);
+  page.setDefaultTimeout(5000);
 
   // Economia de RAM/tempo sem bloquear scripts/XHR.
   await page.route("**/*", async route => {
@@ -654,7 +663,18 @@ async function scrapeShopee(rawUrl) {
     }
 
     // Tenta a API da Shopee a partir do próprio navegador, com cookies/sessão.
-    const browserApiProduct = await fetchProductInsideBrowser(page, canonicalUrl);
+    let browserApiProduct = null;
+    try {
+      browserApiProduct = await Promise.race([
+        fetchProductInsideBrowser(page, canonicalUrl),
+        new Promise((_, reject) =>
+          setTimeout(() => reject(new Error("Browser API timeout interno")), 20000)
+        )
+      ]);
+    } catch (err) {
+      log("BROWSER API FALLBACK", err?.message || String(err));
+    }
+
     if (browserApiProduct?.currentPrice) {
       log("FOUND VIA BROWSER API");
       return browserApiProduct;
@@ -800,7 +820,7 @@ app.get("/", (_req, res) => {
   res.json({
     ok: true,
     service: "Oferta Express Bridge",
-    version: "4.0",
+    version: "5.0",
     mode: "Playwright/Chromium"
   });
 });
@@ -809,7 +829,7 @@ app.get("/health", (_req, res) => {
   res.json({
     ok: true,
     service: "Oferta Express Bridge",
-    version: "4.0",
+    version: "5.0",
     tokenConfigured: Boolean(BRIDGE_TOKEN)
   });
 });
@@ -871,7 +891,7 @@ app.use((_req, res) => {
 });
 
 app.listen(PORT, "0.0.0.0", () => {
-  log(`Oferta Express Bridge v4 online na porta ${PORT}`);
+  log(`Oferta Express Bridge v5 online na porta ${PORT}`);
 
   if (!BRIDGE_TOKEN) {
     log("ATENÇÃO: configure BRIDGE_TOKEN antes de usar /resolve.");
