@@ -593,6 +593,8 @@ async function scrapeShopee(rawUrl) {
   });
 
   let networkProduct = null;
+  const networkDiagnostics = [];
+  const seenDiagnosticPaths = new Set();
 
   page.on("response", async response => {
     try {
@@ -603,6 +605,31 @@ async function scrapeShopee(rawUrl) {
       }
 
       const contentType = String(response.headers()["content-type"] || "");
+      const resourceType = response.request().resourceType();
+
+      let safeEndpoint = url;
+      try {
+        const u = new URL(url);
+        safeEndpoint = `${u.origin}${u.pathname}`;
+      } catch {}
+
+      if (
+        ["xhr", "fetch"].includes(resourceType) &&
+        !seenDiagnosticPaths.has(safeEndpoint) &&
+        networkDiagnostics.length < 50
+      ) {
+        seenDiagnosticPaths.add(safeEndpoint);
+
+        const info = {
+          status: response.status(),
+          type: resourceType,
+          contentType,
+          url: safeEndpoint
+        };
+
+        networkDiagnostics.push(info);
+        log("NETWORK ENDPOINT", info);
+      }
 
       if (!contentType.includes("json")) return;
 
@@ -618,6 +645,12 @@ async function scrapeShopee(rawUrl) {
           (p.images?.length || 0) > (networkProduct.images?.length || 0)
         )
       ) {
+        log("NETWORK PRODUCT CANDIDATE", {
+          currentPrice: p.currentPrice,
+          title: p.title?.slice(0, 120),
+          endpoint: safeEndpoint
+        });
+
         networkProduct = p;
       }
     } catch {}
@@ -794,6 +827,12 @@ async function scrapeShopee(rawUrl) {
       priceMatches.find(p => p > currentPrice) || undefined;
 
     if (!(currentPrice > 0)) {
+      log("NETWORK DIAGNOSTIC SUMMARY", {
+        endpointsSeen: networkDiagnostics.length,
+        productCandidateFound: Boolean(networkProduct?.currentPrice),
+        endpoints: networkDiagnostics.slice(-25)
+      });
+
       throw new Error("Preço não encontrado na página renderizada.");
     }
 
@@ -820,7 +859,7 @@ app.get("/", (_req, res) => {
   res.json({
     ok: true,
     service: "Oferta Express Bridge",
-    version: "5.0",
+    version: "6.0",
     mode: "Playwright/Chromium"
   });
 });
@@ -829,7 +868,7 @@ app.get("/health", (_req, res) => {
   res.json({
     ok: true,
     service: "Oferta Express Bridge",
-    version: "5.0",
+    version: "6.0",
     tokenConfigured: Boolean(BRIDGE_TOKEN)
   });
 });
@@ -891,7 +930,7 @@ app.use((_req, res) => {
 });
 
 app.listen(PORT, "0.0.0.0", () => {
-  log(`Oferta Express Bridge v5 online na porta ${PORT}`);
+  log(`Oferta Express Bridge v6 online na porta ${PORT}`);
 
   if (!BRIDGE_TOKEN) {
     log("ATENÇÃO: configure BRIDGE_TOKEN antes de usar /resolve.");
