@@ -33,19 +33,25 @@ function assertShopeeUrl(raw) {
   } catch {
     throw new Error("URL inválida.");
   }
+
   if (!["http:", "https:"].includes(u.protocol)) {
     throw new Error("Protocolo não permitido.");
   }
+
   if (!isShopeeHost(u.hostname)) {
     throw new Error("Somente links da Shopee são permitidos.");
   }
+
   return u.toString();
 }
 
 function authOk(req) {
   if (!BRIDGE_TOKEN) return false;
-  const header = String(req.headers.authorization || "");
-  return header === `Bearer ${BRIDGE_TOKEN}`;
+  return String(req.headers.authorization || "") === `Bearer ${BRIDGE_TOKEN}`;
+}
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
 }
 
 function toNumber(v) {
@@ -55,16 +61,15 @@ function toNumber(v) {
   const s = String(v).trim();
   if (!s) return undefined;
 
-  // Formatos BR: 1.299,90 / R$ 89,90
-  if (/[,.]/.test(s)) {
-    const cleaned = s.replace(/[^\d,.-]/g, "");
-    if (cleaned.includes(",")) {
-      const n = Number(cleaned.replace(/\./g, "").replace(",", "."));
-      return Number.isFinite(n) ? n : undefined;
-    }
+  const cleaned = s.replace(/[^\d,.-]/g, "");
+  if (!cleaned) return undefined;
+
+  if (cleaned.includes(",")) {
+    const n = Number(cleaned.replace(/\./g, "").replace(",", "."));
+    return Number.isFinite(n) ? n : undefined;
   }
 
-  const n = Number(s.replace(/[^\d.-]/g, ""));
+  const n = Number(cleaned);
   return Number.isFinite(n) ? n : undefined;
 }
 
@@ -72,15 +77,18 @@ function normalizeShopeePrice(v) {
   const n = toNumber(v);
   if (n === undefined) return undefined;
 
-  // A API da Shopee frequentemente usa preço x100000.
-  if (n >= 100000) return Math.round((n / 100000) * 100) / 100;
+  // A Shopee costuma usar inteiros multiplicados por 100000.
+  if (n >= 100000) {
+    return Math.round((n / 100000) * 100) / 100;
+  }
+
   return Math.round(n * 100) / 100;
 }
 
 function uniqueStrings(values) {
   return [...new Set(
     values
-      .flat()
+      .flat(Infinity)
       .filter(Boolean)
       .map(v => String(v).trim())
       .filter(Boolean)
@@ -88,82 +96,141 @@ function uniqueStrings(values) {
 }
 
 function walk(obj, visit, depth = 0) {
-  if (!obj || depth > 10) return;
+  if (!obj || depth > 12) return;
+
   if (Array.isArray(obj)) {
-    for (const v of obj.slice(0, 300)) walk(v, visit, depth + 1);
+    for (const v of obj.slice(0, 500)) {
+      walk(v, visit, depth + 1);
+    }
     return;
   }
+
   if (typeof obj !== "object") return;
+
   visit(obj);
+
   for (const v of Object.values(obj)) {
-    if (v && typeof v === "object") walk(v, visit, depth + 1);
+    if (v && typeof v === "object") {
+      walk(v, visit, depth + 1);
+    }
   }
 }
 
-function productFromApiJson(data, canonicalUrl) {
+function imageUrlFromShopee(value) {
+  if (!value) return undefined;
+
+  const s = String(value).trim();
+  if (!s) return undefined;
+
+  if (/^https?:\/\//i.test(s)) return s;
+
+  // IDs de imagem da Shopee.
+  if (/^[a-zA-Z0-9_-]{10,}$/.test(s)) {
+    return `https://down-br.img.susercontent.com/file/${s}`;
+  }
+
+  return undefined;
+}
+
+function productFromJson(data, canonicalUrl, source = "json") {
   let best = null;
 
   walk(data, (o) => {
-    const title = o.name || o.title || o.item_name;
-    const rawPrice =
-      o.price ?? o.price_min ?? o.priceMin ?? o.current_price ??
-      o.sale_price ?? o.final_price;
-    const price = normalizeShopeePrice(rawPrice);
+    const title =
+      o.name ??
+      o.title ??
+      o.item_name ??
+      o.product_name ??
+      o.display_name;
 
-    const hasProductSignals =
+    const currentPrice = normalizeShopeePrice(
+      o.price ??
+      o.price_min ??
+      o.priceMin ??
+      o.current_price ??
+      o.sale_price ??
+      o.final_price ??
+      o.price_min_before_discount
+    );
+
+    const originalPrice = normalizeShopeePrice(
+      o.price_before_discount ??
+      o.original_price ??
+      o.price_original ??
+      o.price_before ??
+      o.price_max_before_discount
+    );
+
+    const hasSignals =
       title ||
-      o.itemid || o.item_id ||
-      o.shopid || o.shop_id ||
-      o.images || o.image;
+      o.itemid ||
+      o.item_id ||
+      o.shopid ||
+      o.shop_id ||
+      o.images ||
+      o.image ||
+      o.image_list;
 
-    if (!hasProductSignals || !(price > 0)) return;
+    if (!hasSignals || !(currentPrice > 0)) return;
 
-    const imgs = [];
-    if (Array.isArray(o.images)) imgs.push(...o.images);
-    if (o.image) imgs.push(o.image);
-    if (Array.isArray(o.image_list)) imgs.push(...o.image_list);
+    const imageCandidates = [];
 
-    const imageUrls = uniqueStrings(imgs).map(img => {
-      if (/^https?:\/\//i.test(img)) return img;
-      return `https://down-br.img.susercontent.com/file/${img}`;
-    });
+    if (Array.isArray(o.images)) imageCandidates.push(...o.images);
+    if (Array.isArray(o.image_list)) imageCandidates.push(...o.image_list);
+    if (Array.isArray(o.image_urls)) imageCandidates.push(...o.image_urls);
 
-    const candidate = {
+    imageCandidates.push(
+      o.image,
+      o.image_url,
+      o.cover,
+      o.cover_image
+    );
+
+    const images = uniqueStrings(
+      imageCandidates.map(imageUrlFromShopee)
+    );
+
+    const product = {
       title: title ? String(title).trim() : undefined,
-      currentPrice: price,
-      originalPrice: normalizeShopeePrice(
-        o.price_before_discount ??
-        o.original_price ??
-        o.price_original ??
-        o.price_before
-      ),
-      images: imageUrls,
+      currentPrice,
+      originalPrice:
+        originalPrice && originalPrice > currentPrice
+          ? originalPrice
+          : undefined,
+      images,
       rating: toNumber(
         o.item_rating?.rating_star ??
         o.rating_star ??
-        o.rating
+        o.rating ??
+        o.rating_avg
       ),
       soldCount: toNumber(
         o.historical_sold ??
         o.sold ??
-        o.sold_count
+        o.sold_count ??
+        o.global_sold
       ),
       sellerName:
         o.shop_name ??
         o.shop?.name ??
         o.seller_name ??
+        o.shop_info?.name ??
         undefined,
       canonicalUrl,
-      source: "online_playwright_api"
+      source
     };
 
     const score =
-      (candidate.title ? 3 : 0) +
-      (candidate.images.length ? 2 : 0) +
-      (candidate.currentPrice ? 4 : 0) +
-      (candidate.sellerName ? 1 : 0);
+      (product.title ? 5 : 0) +
+      (product.currentPrice ? 6 : 0) +
+      (product.images.length ? 3 : 0) +
+      (product.originalPrice ? 1 : 0) +
+      (product.sellerName ? 1 : 0) +
+      (product.rating ? 1 : 0);
 
-    if (!best || score > best.score) best = { score, product: candidate };
+    if (!best || score > best.score) {
+      best = { score, product };
+    }
   });
 
   return best?.product || null;
@@ -192,7 +259,100 @@ async function getBrowser() {
       throw err;
     });
   }
+
   return browserPromise;
+}
+
+async function waitForStableUrl(page, maxMs = 8000) {
+  let last = page.url();
+  let stableFor = 0;
+  const step = 500;
+
+  for (let elapsed = 0; elapsed < maxMs; elapsed += step) {
+    await sleep(step);
+
+    const now = page.url();
+
+    if (now === last) {
+      stableFor += step;
+      if (stableFor >= 1500) return now;
+    } else {
+      last = now;
+      stableFor = 0;
+    }
+  }
+
+  return page.url();
+}
+
+function parseJsonLoose(text) {
+  if (!text) return null;
+
+  const trimmed = String(text).trim();
+  if (!trimmed) return null;
+
+  try {
+    return JSON.parse(trimmed);
+  } catch {}
+
+  return null;
+}
+
+async function extractFromScripts(page, canonicalUrl) {
+  const scriptPayloads = await page.evaluate(() => {
+    const out = [];
+
+    for (const s of document.querySelectorAll("script")) {
+      const txt = s.textContent || "";
+
+      if (
+        txt.length > 20 &&
+        txt.length < 2_500_000 &&
+        (
+          txt.includes('"price"') ||
+          txt.includes('"price_min"') ||
+          txt.includes('"itemid"') ||
+          txt.includes('"item_id"') ||
+          txt.includes('"product"')
+        )
+      ) {
+        out.push(txt);
+      }
+    }
+
+    return out.slice(0, 60);
+  }).catch(() => []);
+
+  let best = null;
+
+  for (const raw of scriptPayloads) {
+    // JSON puro.
+    const direct = parseJsonLoose(raw);
+    if (direct) {
+      const p = productFromJson(direct, canonicalUrl, "script_json");
+      if (p?.currentPrice && (!best || (p.images?.length || 0) > (best.images?.length || 0))) {
+        best = p;
+      }
+    }
+
+    // Alguns scripts guardam JSON dentro de uma atribuição JS.
+    const firstBrace = raw.indexOf("{");
+    const lastBrace = raw.lastIndexOf("}");
+
+    if (firstBrace >= 0 && lastBrace > firstBrace) {
+      const maybe = raw.slice(firstBrace, lastBrace + 1);
+      const parsed = parseJsonLoose(maybe);
+
+      if (parsed) {
+        const p = productFromJson(parsed, canonicalUrl, "script_embedded_json");
+        if (p?.currentPrice && (!best || (p.images?.length || 0) > (best.images?.length || 0))) {
+          best = p;
+        }
+      }
+    }
+  }
+
+  return best;
 }
 
 async function scrapeShopee(rawUrl) {
@@ -214,105 +374,110 @@ async function scrapeShopee(rawUrl) {
 
   const page = await context.newPage();
   page.setDefaultNavigationTimeout(NAV_TIMEOUT);
-  page.setDefaultTimeout(8000);
+  page.setDefaultTimeout(6000);
 
-  let apiProduct = null;
+  // Economia de RAM/tempo sem bloquear scripts/XHR.
+  await page.route("**/*", async route => {
+    const type = route.request().resourceType();
 
-  page.on("response", async (response) => {
+    if (["font", "media"].includes(type)) {
+      return route.abort();
+    }
+
+    return route.continue();
+  });
+
+  let networkProduct = null;
+
+  page.on("response", async response => {
     try {
       const url = response.url();
-      if (!/shopee\.com\.br/i.test(url)) return;
-      if (!/api|pdp|item|get_pc|detail/i.test(url)) return;
 
-      const ct = String(response.headers()["content-type"] || "");
-      if (!ct.includes("json")) return;
+      if (!/shopee\.com\.br|shopeeusercontent\.com|susercontent\.com/i.test(url)) {
+        return;
+      }
+
+      const contentType = String(response.headers()["content-type"] || "");
+
+      if (!contentType.includes("json")) return;
 
       const data = await response.json().catch(() => null);
       if (!data) return;
 
-      const p = productFromApiJson(data, page.url() || safeUrl);
-      if (p?.currentPrice && !apiProduct) {
-        apiProduct = p;
+      const p = productFromJson(data, page.url() || safeUrl, "network_json");
+
+      if (
+        p?.currentPrice &&
+        (
+          !networkProduct ||
+          (p.images?.length || 0) > (networkProduct.images?.length || 0)
+        )
+      ) {
+        networkProduct = p;
       }
     } catch {}
   });
 
   try {
-  await page.goto(safeUrl, {
-    waitUntil: "domcontentloaded",
-    timeout: NAV_TIMEOUT
-  });
-} catch (err) {
-  log("NAVIGATION NOTICE", err?.message || String(err));
-}
+    log("OPEN", safeUrl);
 
-// Links curtos da Shopee fazem vários redirecionamentos.
-// Esperamos a URL parar de mudar antes de tentar ler o produto.
-let ultimaUrl = page.url();
-let urlEstavel = 0;
-
-for (let i = 0; i < 30; i++) {
-  await page.waitForTimeout(1000);
-
-  const urlAtual = page.url();
-
-  if (urlAtual === ultimaUrl) {
-    urlEstavel++;
-
-    if (urlEstavel >= 3) {
-      break;
+    try {
+      await page.goto(safeUrl, {
+        waitUntil: "domcontentloaded",
+        timeout: NAV_TIMEOUT
+      });
+    } catch (err) {
+      // Links curtos da Shopee podem destruir o contexto durante o redirecionamento.
+      log("NAVIGATION NOTICE", err?.message || String(err));
     }
-  } else {
-    ultimaUrl = urlAtual;
-    urlEstavel = 0;
-  }
-}
 
-log("FINAL URL", page.url());
+    const canonicalUrl = await waitForStableUrl(page, 7000);
 
-// Espera a aplicação da Shopee carregar os dados dinâmicos.
-await page.waitForTimeout(5000);
-
-    // O link curto pode ter redirecionado para um host final da Shopee.
-    const canonicalUrl = page.url();
     const final = new URL(canonicalUrl);
+
     if (!isShopeeHost(final.hostname)) {
       throw new Error("O link redirecionou para um domínio não autorizado.");
     }
 
-    // Dá um pouco mais de tempo caso a API de produto esteja chegando após o DOM.
-    if (!apiProduct) {
-      await page.waitForTimeout(1800);
+    log("FINAL URL", canonicalUrl);
+
+    // Se a rede já entregou o produto, não esperamos mais.
+    if (networkProduct?.currentPrice) {
+      networkProduct.canonicalUrl = canonicalUrl;
+      log("FOUND VIA NETWORK");
+      return networkProduct;
     }
 
-    if (apiProduct?.currentPrice > 0) {
-      apiProduct.canonicalUrl = canonicalUrl;
-      return apiProduct;
+    // Dá uma chance curta para chamadas XHR que chegam logo depois do redirecionamento.
+    await sleep(1800);
+
+    if (networkProduct?.currentPrice) {
+      networkProduct.canonicalUrl = canonicalUrl;
+      log("FOUND VIA NETWORK AFTER WAIT");
+      return networkProduct;
+    }
+
+    // Procura JSON embutido na página.
+    const scriptProduct = await extractFromScripts(page, canonicalUrl);
+
+    if (scriptProduct?.currentPrice) {
+      log("FOUND VIA SCRIPT");
+      return scriptProduct;
     }
 
     const dom = await page.evaluate(() => {
-      const text = (sel) => {
-        const el = document.querySelector(sel);
-        return el?.textContent?.trim() || undefined;
-      };
+      const text = sel =>
+        document.querySelector(sel)?.textContent?.trim() || undefined;
 
       const attr = (sel, name) =>
         document.querySelector(sel)?.getAttribute(name) || undefined;
 
       const metas = {};
+
       for (const m of document.querySelectorAll("meta")) {
         const key = m.getAttribute("property") || m.getAttribute("name");
         const val = m.getAttribute("content");
         if (key && val) metas[key] = val;
-      }
-
-      const jsonLd = [];
-      for (const s of document.querySelectorAll('script[type="application/ld+json"]')) {
-        try {
-          const parsed = JSON.parse(s.textContent || "");
-          if (Array.isArray(parsed)) jsonLd.push(...parsed);
-          else jsonLd.push(parsed);
-        } catch {}
       }
 
       const bodyText = document.body?.innerText || "";
@@ -323,53 +488,35 @@ await page.waitForTimeout(5000);
           metas["og:title"] ||
           document.title ||
           undefined,
+
         image:
           metas["og:image"] ||
+          metas["twitter:image"] ||
           attr('link[rel="image_src"]', "href"),
+
         metaPrice:
           metas["product:price:amount"] ||
           metas["og:price:amount"] ||
-          metas["product:price"],
-        jsonLd,
-        bodyText: bodyText.slice(0, 60000)
+          metas["product:price"] ||
+          metas["twitter:data1"],
+
+        bodyText: bodyText.slice(0, 100000)
       };
+    }).catch(err => {
+      throw new Error(`Falha ao ler a página após o redirecionamento: ${err.message}`);
     });
 
-    // JSON-LD
-    for (const block of dom.jsonLd || []) {
-      const candidates = block?.["@graph"] || [block];
-      for (const item of candidates) {
-        if (!item || typeof item !== "object") continue;
-        const type = String(item["@type"] || "").toLowerCase();
-        if (type && !type.includes("product")) continue;
+    const challenge =
+      /captcha|verifique|verification|unusual|robô|robot|access denied|bloquead/i
+        .test(dom.bodyText || "");
 
-        const offers = Array.isArray(item.offers) ? item.offers[0] : item.offers;
-        const price = normalizeShopeePrice(
-          offers?.price ?? offers?.lowPrice ?? dom.metaPrice
-        );
-
-        if (price > 0) {
-          const imgs = Array.isArray(item.image) ? item.image : [item.image, dom.image];
-          return {
-            title: item.name || dom.title || "Produto Shopee",
-            currentPrice: price,
-            originalPrice: undefined,
-            images: uniqueStrings(imgs),
-            rating: toNumber(item.aggregateRating?.ratingValue),
-            soldCount: undefined,
-            sellerName:
-              offers?.seller?.name ||
-              item.brand?.name ||
-              undefined,
-            canonicalUrl,
-            source: "online_playwright_jsonld"
-          };
-        }
-      }
+    if (challenge) {
+      throw new Error("Shopee apresentou verificação/bloqueio ao navegador online.");
     }
 
-    // Último fallback: texto visível + metadados.
-    const priceMatches = [...String(dom.bodyText || "").matchAll(/R\$\s*([\d.]+,\d{2})/g)]
+    const priceMatches = [
+      ...String(dom.bodyText || "").matchAll(/R\$\s*([\d.]+,\d{2})/g)
+    ]
       .map(m => toNumber(m[1]))
       .filter(n => n && n > 0 && n < 1000000);
 
@@ -378,19 +525,13 @@ await page.waitForTimeout(5000);
       priceMatches[0];
 
     const originalPrice =
-      priceMatches.length > 1 && priceMatches[1] > currentPrice
-        ? priceMatches[1]
-        : undefined;
+      priceMatches.find(p => p > currentPrice) || undefined;
 
     if (!(currentPrice > 0)) {
-      const challenge =
-        /captcha|verifique|verification|unusual|robô|robot/i.test(dom.bodyText || "");
-      throw new Error(
-        challenge
-          ? "Shopee apresentou verificação/bloqueio ao navegador online."
-          : "Preço não encontrado na página renderizada."
-      );
+      throw new Error("Preço não encontrado na página renderizada.");
     }
+
+    log("FOUND VIA DOM");
 
     return {
       title: dom.title || "Produto Shopee",
@@ -401,7 +542,7 @@ await page.waitForTimeout(5000);
       soldCount: undefined,
       sellerName: undefined,
       canonicalUrl,
-      source: "online_playwright_dom"
+      source: "dom"
     };
   } finally {
     await page.close().catch(() => {});
@@ -413,6 +554,7 @@ app.get("/", (_req, res) => {
   res.json({
     ok: true,
     service: "Oferta Express Bridge",
+    version: "2.0",
     mode: "Playwright/Chromium"
   });
 });
@@ -421,6 +563,7 @@ app.get("/health", (_req, res) => {
   res.json({
     ok: true,
     service: "Oferta Express Bridge",
+    version: "2.0",
     tokenConfigured: Boolean(BRIDGE_TOKEN)
   });
 });
@@ -434,6 +577,7 @@ app.post("/resolve", async (req, res) => {
   }
 
   const url = req.body?.url;
+
   if (!url) {
     return res.status(400).json({
       ok: false,
@@ -448,6 +592,7 @@ app.post("/resolve", async (req, res) => {
 
     log("SUCCESS", {
       ms: Date.now() - started,
+      source: product.source,
       title: product.title,
       currentPrice: product.currentPrice,
       images: product.images?.length || 0
@@ -459,7 +604,11 @@ app.post("/resolve", async (req, res) => {
     });
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    log("ERROR", message);
+
+    log("ERROR", {
+      ms: Date.now() - started,
+      message
+    });
 
     return res.status(502).json({
       ok: false,
@@ -469,11 +618,15 @@ app.post("/resolve", async (req, res) => {
 });
 
 app.use((_req, res) => {
-  res.status(404).json({ ok: false, error: "Rota não encontrada." });
+  res.status(404).json({
+    ok: false,
+    error: "Rota não encontrada."
+  });
 });
 
 app.listen(PORT, "0.0.0.0", () => {
-  log(`Oferta Express Bridge online na porta ${PORT}`);
+  log(`Oferta Express Bridge v2 online na porta ${PORT}`);
+
   if (!BRIDGE_TOKEN) {
     log("ATENÇÃO: configure BRIDGE_TOKEN antes de usar /resolve.");
   }
@@ -484,6 +637,7 @@ async function shutdown() {
     const browser = await browserPromise;
     if (browser) await browser.close();
   } catch {}
+
   process.exit(0);
 }
 
